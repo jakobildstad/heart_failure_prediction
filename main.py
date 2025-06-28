@@ -1,96 +1,209 @@
 """
-main.py
--------
+main.py  –  Universal CLI entry point
+=====================================
 
-Single entry point.  Run `python main.py` from the repo root
-and the script will:
-
-    1. Pre-process data
-    2. Train the network (with early stopping)
-    3. Evaluate on hold-out test split
-    4. Save artefacts (scaler + model weights)
-
-Feel free to tweak hyper-parameters here and re-run.
+$ python main.py train
+$ python main.py evaluate -m model/best_heartnet.pth
+$ python main.py predict  -m model/best_heartnet.pth
 """
 
+from __future__ import annotations
+import argparse
 from pathlib import Path
+import pickle
 
+import pandas as pd
 import torch
-from torch.utils.data import DataLoader
 
+# ────────────────────────────────────────────────────────────────
+#  0.  Import *your* library code
+#      (make sure modules/ is a package → add an empty __init__.py)
+# ────────────────────────────────────────────────────────────────
+from modules.pipeline import training_pipeline
 from modules.preprocess import (
     load_data,
     prepare_features,
     TabularDataset,
-    save_scaler,
 )
-from model.trainer import HeartNet, train, evaluate
+from modules.trainer import HeartNet, evaluate                    # includes FMR / FNMR
+
 
 # ────────────────────────────────────────────────────────────────
-# ✦ 0. Config  (change here, not in library code)
+#  1.  CLI set-up
 # ────────────────────────────────────────────────────────────────
-DATA_PATH = Path("data/heart.csv")
-BATCH_SIZE = 64
-EPOCHS = 200
-LEARNING_RATE = 1e-3
-DEVICE = "cpu"  # change to "cuda" if you have a GPU
+def build_parser() -> argparse.ArgumentParser:
+    p = argparse.ArgumentParser(description="Heart-disease net – CLI")
+    sub = p.add_subparsers(dest="cmd", required=True)
+
+    # train ----------------------------------------------------------------
+    train_p = sub.add_parser("train", help="Run full training pipeline")
+    train_p.add_argument(
+        "--csv", type=Path, default=Path("data/heart.csv"),
+        help="Path to raw CSV")
+
+    # evaluate -------------------------------------------------------------
+    eval_p = sub.add_parser("evaluate", help="Evaluate saved model")
+    eval_p.add_argument("-m", "--model", type=Path, required=True,
+                        help="Path to .pth weights file")
+    eval_p.add_argument("--csv", type=Path, default=Path("data/heart.csv"))
+    eval_p.add_argument("--threshold", type=float, default=None,
+                        help="Fixed threshold (omit to use EER point)")
+
+    # predict --------------------------------------------------------------
+    pred_p = sub.add_parser("predict", help="Interactive prediction")
+    pred_p.add_argument("-m", "--model", type=Path, required=True,
+                        help="Path to .pth weights file")
+    pred_p.add_argument("--scaler", type=Path, default=Path("model/scaler.pkl"))
+    pred_p.add_argument("--features", type=Path, default=Path("model/feature_names.pkl"))
+    pred_p.add_argument("--threshold", type=float, default=0.5)
+
+    return p
 
 
+# ────────────────────────────────────────────────────────────────
+#  2.  Helpers
+# ────────────────────────────────────────────────────────────────
+def load_artefacts(
+    model_path: Path,
+    scaler_path: Path = Path("model/scaler.pkl"),
+    features_path: Path = Path("model/feature_names.pkl"),
+) -> tuple[HeartNet, object, list[str]]:
+    """Load network weights, StandardScaler, & feature-name order."""
+    with open(scaler_path, "rb") as f:
+        scaler = pickle.load(f)
+    with open(features_path, "rb") as f:
+        feature_names = pickle.load(f)
+
+    net = HeartNet(num_features=len(feature_names))
+    net.load_state_dict(torch.load(model_path, map_location="cpu"))
+    net.eval()
+    return net, scaler, feature_names
+
+
+# --------------------------------------------------------------------------------
+# helper that runs *once* to grab metadata from the raw CSV
+# --------------------------------------------------------------------------------
+def _column_metadata(csv_path: Path = Path("data/heart.csv")) -> dict[str, dict]:
+    df = pd.read_csv(csv_path)
+
+    meta: dict[str, dict] = {}
+    for col in df.columns:
+        if col == "HeartDisease":          # skip label
+            continue
+
+        if pd.api.types.is_numeric_dtype(df[col]):
+            meta[col] = {
+                "kind": "numeric",
+                "min": df[col].min(),
+                "max": df[col].max(),
+                "mean": round(df[col].mean(), 1),
+            }
+        else:
+            uniq = df[col].dropna().unique().tolist()
+            meta[col] = {
+                "kind": "categorical",
+                "choices": uniq[:6],        # truncate long lists
+                "n_unique": len(uniq),
+            }
+    return meta
+
+
+# cache so we don’t read the CSV every time
+_META = _column_metadata()
+
+
+# --------------------------------------------------------------------------------
+# interactive prompt
+# --------------------------------------------------------------------------------
+def interactive_example(raw_columns: list[str]) -> dict:
+    """
+    Ask the user for each raw feature value via stdin, displaying helpful
+    type / range / choice hints derived from heart.csv.
+    """
+    print("\nEnter values (press Return after each):")
+    example: dict[str, object] = {}
+
+    for col in raw_columns:
+        m = _META.get(col, {"kind": "unknown"})
+
+        if m["kind"] == "numeric":
+            hint = f"numeric, {m['min']}–{m['max']}, mean={m['mean']}"
+        elif m["kind"] == "categorical":
+            if m["n_unique"] <= 2:
+                hint = f"binary {m['choices'][0]}|{m['choices'][1]}"
+            else:
+                choice_preview = "|".join(str(c) for c in m["choices"])
+                more = "…" if m["n_unique"] > 6 else ""
+                hint = f"categorical, choices={choice_preview}{more}"
+        else:
+            hint = "value"
+
+        # prompt ↓
+        raw = input(f"  {col} [{hint}] : ").strip()
+
+        # cast if numeric
+        if m["kind"] == "numeric":
+            try:
+                raw = float(raw)
+            except ValueError:
+                print(f"    ⚠️  Expected a number; keeping as string.")
+        example[col] = raw
+
+    return example
+
+
+# ────────────────────────────────────────────────────────────────
+#  3.  Main dispatch
+# ────────────────────────────────────────────────────────────────
 def main():
-    # 1. Load + preprocess
-    print("Loading data …")
-    df = load_data(DATA_PATH)
+    args = build_parser().parse_args()
 
-    (
-        X_train,
-        y_train,
-        X_val,
-        y_val,
-        X_test,
-        y_test,
-        scaler,
-        feature_names,
-    ) = prepare_features(df)
+    if args.cmd == "train":
+        # just pass through to your pipeline
+        training_pipeline()
+        return
 
-    # Save scaler for production use
-    save_scaler(scaler, "scaler.pkl")
+    if args.cmd == "evaluate":
+        net, scaler, feature_names = load_artefacts(args.model)
+        # Re-prep the DATASET exactly like training did
+        df = load_data(args.csv)
+        (
+            _Xtr, _ytr, _Xval, _yval, Xtest, ytest, _sc, _feat_names
+        ) = prepare_features(df)
+        # Note: we ignore the scaler returned here – we already loaded the
+        # one fitted on TRAIN; DataLoader uses *those* scaled values.
+        from torch.utils.data import DataLoader, TensorDataset
+        test_loader = DataLoader(
+            TensorDataset(Xtest, ytest), batch_size=256, shuffle=False
+        )
+        metrics = evaluate(
+            net, test_loader, device="cpu", threshold=args.threshold
+        )
+        print("\nTest-set metrics:")
+        for k, v in metrics.items():
+            print(f"  {k:>10s}: {v:.4f}")
+        return
 
-    # 2. Build DataLoaders
-    train_loader = DataLoader(
-        TabularDataset(X_train, y_train), batch_size=BATCH_SIZE, shuffle=True
-    )
-    val_loader = DataLoader(
-        TabularDataset(X_val, y_val), batch_size=BATCH_SIZE, shuffle=False
-    )
-    test_loader = DataLoader(
-        TabularDataset(X_test, y_test), batch_size=BATCH_SIZE, shuffle=False
-    )
+    if args.cmd == "predict":
+        net, scaler, feature_names = load_artefacts(
+            args.model, args.scaler, args.features
+        )
+        # reconstruct raw column list by reading *one* row of CSV header
+        raw_cols = pd.read_csv("data/heart.csv", nrows=0).columns.tolist()
+        raw_cols.remove("HeartDisease")  # drop label
+        sample = interactive_example(raw_cols)
 
-    # 3. Instantiate model
-    model = HeartNet(num_features=X_train.shape[1])
-    print(model)
+        # --- reuse the preprocess_single logic from predict.py ----------
+        from modules.predict import preprocess_single as _pre  # type: ignore
 
-    # 4. Train
-    model = train(
-        model,
-        train_loader,
-        val_loader,
-        epochs=EPOCHS,
-        lr=LEARNING_RATE,
-        device=DEVICE,
-        patience=10,
-        ckpt_path="best_heartnet.pth",
-    )
-
-    # 5. Evaluate
-    metrics = evaluate(model, test_loader, device=DEVICE)
-    print("\nTest-set metrics:")
-    for k, v in metrics.items():
-        print(f"  {k:>8s}: {v:.4f}")
-
-    # 6. Save final model (already saved best weights inside `train()`)
-    torch.save(model.state_dict(), "model/best_heartnet.pth")
-    print("\nAll artefacts saved - ready for inference!")
+        x = _pre(sample)
+        with torch.no_grad():
+            prob = float(net(x).item())
+        decision = int(prob >= args.threshold)
+        print(f"\nProbability = {prob:.3f}")
+        print(f"Decision    = {decision} "
+              f"({'Positive' if decision else 'Negative'})")
+        return
 
 
 if __name__ == "__main__":
