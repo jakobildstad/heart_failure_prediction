@@ -38,8 +38,10 @@ def load_data(csv_path: Path | str) -> pd.DataFrame:
 def prepare_features(
     df: pd.DataFrame,
     target_col: str = "HeartDisease",
-    test_size: float = 0.15,
-    val_size: float = 0.15,
+    test_size: float = 0.15, # proportion of data for test set (0-1)
+    val_size: float = 0.15, # proportion of data for validation set (0-1)
+    # random_state for reproducibility
+    # This ensures that the same random splits are made every time you run the code.
     random_state: int = 42,
 ) -> Tuple[
     torch.Tensor, 
@@ -53,7 +55,7 @@ def prepare_features(
 ]:
     """
     Returns:
-        X_train, y_train, X_val, y_val as *Torch tensors*
+        X_train, y_train, X_val, y_val, X_train, y_train as *Torch tensors*
         fitted StandardScaler
         feature_names (list) - useful when you deploy and need to know order
     Steps:
@@ -62,11 +64,11 @@ def prepare_features(
         3. Fit scaler *only* on train numerics
         4. Convert to float32 tensors
     """
-    df = df.copy()
+    df = df.copy() #create a copy of the DataFrame to avoid modifying the original data
 
     # 1. Separate target -----------------------------------------
-    y = df[target_col].astype("float32").values  # shape (N,)
-    X = df.drop(columns=[target_col])
+    y = df[target_col].astype("float32").values  # shape (N,) #Fetches the target column
+    X = df.drop(columns=[target_col]) # Drop the target column from the DataFrame to get the feature matrix
 
     # Identify categorical columns automatically (object or category dtype)
     cat_cols = X.select_dtypes(include=["object", "category"]).columns.tolist()

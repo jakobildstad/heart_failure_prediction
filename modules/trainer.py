@@ -115,7 +115,7 @@ def train(
     lr: float = 1e-3,
     device: str | torch.device = "cpu",
     patience: int = 10,
-    ckpt_path: Path | str = "model_best.pth",
+    ckpt_path: Path | str = Path("model/model_best.pth"),
 ):
     """
     Standard training loop with *early stopping*.
